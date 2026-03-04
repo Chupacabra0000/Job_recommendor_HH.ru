@@ -288,7 +288,7 @@ def _fetch_term(area_id: int, term: str, per_term: int, period_days: int, refres
 @st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
 def _fetch_details(vacancy_id: str) -> str:
     full = vacancy_details(vacancy_id)
-    return _strip_html(full.get("description"
+    return _strip_html(full.get("description") or "")
 
 # ---------- GLOBAL PRE-INDEX (area + period_days) ----------
 # Stores:
