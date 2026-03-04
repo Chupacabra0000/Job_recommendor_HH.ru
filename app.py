@@ -1,6 +1,4 @@
 import math
-import os
-import pickle
 import re
 import html as _html
 import hashlib
@@ -18,7 +16,8 @@ from db import (
     create_session, get_user_by_token, delete_session,
     list_saved_searches, get_latest_saved_search, create_or_get_saved_search,
     upsert_saved_search_results, touch_ranked, touch_refreshed,
-    enforce_saved_search_limit, delete_saved_search, list_default_timeline
+    enforce_saved_search_limit, delete_saved_search, list_default_timeline,
+    get_global_vacancies_by_ids
 )
 
 from hh_client import fetch_vacancies, vacancy_details
@@ -28,7 +27,9 @@ from tfidf_terms import extract_terms
 from embedding_store import init_store, get_embedding, put_embedding
 from hh_areas import fetch_areas_tree, list_regions_and_cities
 from search_cleanup import enforce_limit_and_cleanup
-
+from faiss_search_index import delete_index_dir
+from global_index_manager import GlobalIndexConfig, refresh_global_index
+from global_faiss_index import load_index as load_global_index, search as search_global_index
 
 # ---------- constants ----------
 COL_JOB_ID = "Job Id"
@@ -42,72 +43,88 @@ COL_DESC = "offer_details"
 
 DEFAULT_STARTUP_LIMIT = 500
 PER_TERM = 50
-TERMS_MIN = 6
-TERMS_MAX = 10
-
 MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-MAX_DESC_CHARS = 2500
+
+TERMS_MIN = 6
+TERMS_MAX = 18
+
+SAVED_SEARCH_MAX = 3
+DEFAULT_UPDATE_INTERVAL_HOURS = 24
+DEFAULT_REFRESH_WINDOW_HOURS = 24
+
+DETAILS_CACHE_MAX = 600
 
 # ---------- page ----------
-st.set_page_config(page_title="HH Job Recommender", page_icon="", layout="wide")
+st.set_page_config(page_title="HH Job Recommender", page_icon="💼", layout="wide")
 init_db()
 init_store()
 
-# ---------- state ----------
-if "user" not in st.session_state:
-    st.session_state.user = None
-if "details_cache" not in st.session_state:
-    st.session_state.details_cache = {}
-if "terms_text" not in st.session_state:
-    st.session_state.terms_text = ""
-if "resume_hash_for_terms" not in st.session_state:
-    st.session_state.resume_hash_for_terms = ""
-if "refresh_nonce" not in st.session_state:
-    st.session_state.refresh_nonce = 0
-if "last_results_df" not in st.session_state:
-    st.session_state.last_results_df = None
-if "last_results_meta" not in st.session_state:
-    st.session_state.last_results_meta = None
-if "last_fetch_at" not in st.session_state:
-    st.session_state.last_fetch_at = None
-if "page" not in st.session_state:
-    st.session_state.page = 1
-
-
-# ---------- persistent login (URL token) ----------
-token = st.query_params.get("token", "")
-if st.session_state.user is None and token:
-    u = get_user_by_token(token)
-    if u:
-        st.session_state.user = u
-
+# ---------- styles ----------
+st.markdown(
+    """
+    <style>
+      .center-wrap { max-width: 520px; margin: 0 auto; }
+      .card { border: 1px solid rgba(49,51,63,.15); border-radius: 14px; padding: 16px 18px; margin-bottom: 14px; }
+      .pill { display: inline-block; padding: 2px 10px; border-radius: 999px;
+              border: 1px solid rgba(49,51,63,.2); margin-right: 6px; margin-top: 6px; font-size: 0.85rem; }
+      .pill-strong { font-weight: 600; }
+      .snippet { color: rgba(49,51,63,.82); font-size: 0.95rem; margin-top: 8px; }
+      .skill-chip { display: inline-block; margin: 4px 6px 0 0; padding: 2px 8px; border-radius: 999px;
+                    background: rgba(49,51,63,.06); font-size: 0.85rem; }
+      .muted { color: rgba(49,51,63,.65); }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 # ---------- helpers ----------
-def extract_text_from_pdf(pdf_bytes: bytes) -> str:
-    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
-    return "\n".join([page.get_text("text") for page in doc]).strip()
-
-
 def _strip_html(s: str) -> str:
-    if not s:
-        return ""
+    # very light sanitize
+    s = re.sub(r"<br\s*/?>", "\n", s, flags=re.I)
     s = re.sub(r"<[^>]+>", " ", s)
     s = _html.unescape(s)
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
-def _truncate(s: str, n: int = MAX_DESC_CHARS) -> str:
-    s = (s or "").strip()
-    if len(s) <= n:
-        return s
-    return s[:n].rstrip() + "…"
+def _truncate(s: str, n: int = 1200) -> str:
+    s = s or ""
+    return s if len(s) <= n else s[: n - 1] + "…"
 
 
-@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
-def _fetch_details(vacancy_id: str) -> str:
-    full = vacancy_details(vacancy_id)
-    return _strip_html(full.get("description") or "")
+def _snippet(job_text: str) -> str:
+    job_text = job_text or ""
+    job_text = job_text.strip()
+    if not job_text:
+        return ""
+    # show first 240 chars as snippet
+    return _html.escape(_truncate(job_text, 240))
+
+
+def _now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _read_pdf_text(file_bytes: bytes) -> str:
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    text_parts = []
+    for page in doc:
+        text_parts.append(page.get_text("text"))
+    doc.close()
+    return "\n".join(text_parts).strip()
+
+
+def _dedupe_merge(batches: List[List[dict]]) -> List[dict]:
+    seen = set()
+    out = []
+    for b in batches:
+        for it in b:
+            vid = str(it.get("id", "")).strip()
+            if not vid or vid in seen:
+                continue
+            seen.add(vid)
+            out.append(it)
+    return out
 
 
 def _job_text(row: pd.Series) -> str:
@@ -115,33 +132,16 @@ def _job_text(row: pd.Series) -> str:
         str(row.get(COL_POSITION, "") or ""),
         str(row.get(COL_WORKPLACE, "") or ""),
         str(row.get(COL_MODE, "") or ""),
-        str(row.get(COL_SALARY, "") or ""),
-        str(row.get(COL_SKILLS, "") or ""),
         str(row.get(COL_DUTIES, "") or ""),
+        str(row.get(COL_SKILLS, "") or ""),
         _truncate(str(row.get(COL_DESC, "") or "")),
     ]
     s = " ".join(p for p in parts if p)
     return re.sub(r"\s+", " ", s).strip()
 
 
-def _salary_to_text(sal: dict | None) -> str:
-    if not isinstance(sal, dict):
-        return ""
-    s_from = sal.get("from")
-    s_to = sal.get("to")
-    cur = sal.get("currency")
-    if s_from is not None and s_to is not None:
-        return f"{s_from}–{s_to} {cur}"
-    if s_from is not None:
-        return f"от {s_from} {cur}"
-    if s_to is not None:
-        return f"до {s_to} {cur}"
-    return ""
-
-
 def _items_to_df(items: List[dict]) -> pd.DataFrame:
     rows = []
-
     for it in items:
         vid = str(it.get("id", "")).strip()
         if not vid:
@@ -149,34 +149,47 @@ def _items_to_df(items: List[dict]) -> pd.DataFrame:
         title = (it.get("name") or "").strip()
 
         employer = ""
-        if it.get("employer"):
-            employer = (it["employer"] or {}).get("name", "")
+        emp = it.get("employer") or {}
+        if isinstance(emp, dict):
+            employer = emp.get("name", "") or ""
 
         schedule = it.get("schedule") or {}
         working_mode = schedule.get("name", "") if isinstance(schedule, dict) else ""
 
-        salary_text = _salary_to_text(it.get("salary"))
+        salary_text = ""
+        sal = it.get("salary")
+        if isinstance(sal, dict):
+            s_from = sal.get("from")
+            s_to = sal.get("to")
+            cur = sal.get("currency")
+            if s_from is not None and s_to is not None:
+                salary_text = f"{s_from}–{s_to} {cur}"
+            elif s_from is not None:
+                salary_text = f"от {s_from} {cur}"
+            elif s_to is not None:
+                salary_text = f"до {s_to} {cur}"
 
         snippet = it.get("snippet") or {}
         duties = ""
         skills = ""
-
         if isinstance(snippet, dict):
             duties = (snippet.get("responsibility") or "").strip()
             skills = (snippet.get("requirement") or "").strip()
 
-        rows.append({
-            COL_JOB_ID: vid,
-            COL_WORKPLACE: employer,
-            COL_MODE: working_mode,
-            COL_SALARY: salary_text,
-            COL_POSITION: title,
-            COL_DUTIES: duties,
-            COL_SKILLS: skills,
-            COL_DESC: "",
-            "alternate_url": it.get("alternate_url", "") or "",
-            "published_at": it.get("published_at", "") or ""
-        })
+        rows.append(
+            {
+                COL_JOB_ID: vid,
+                COL_WORKPLACE: employer,
+                COL_MODE: working_mode,
+                COL_SALARY: salary_text,
+                COL_POSITION: title,
+                COL_DUTIES: duties,
+                COL_SKILLS: skills,
+                COL_DESC: "",
+                "alternate_url": it.get("alternate_url", "") or "",
+                "published_at": it.get("published_at", "") or "",
+            }
+        )
 
     df = pd.DataFrame(rows)
     if len(df):
@@ -186,591 +199,626 @@ def _items_to_df(items: List[dict]) -> pd.DataFrame:
     return df
 
 
-def _dedupe_merge(list_of_items: List[List[dict]]) -> List[dict]:
-    seen = set()
-    out = []
-    for items in list_of_items:
-        for it in items:
-            vid = str(it.get("id", "")).strip()
-            if not vid or vid in seen:
-                continue
-            seen.add(vid)
-            out.append(it)
-    return out
-
-
-# ---------- GLOBAL PRE-INDEX (area_id + period_days) ----------
-# Goal: build a reusable global FAISS index of recent vacancies for the chosen area/timeframe.
-# This avoids re-fetching + re-embedding + rebuilding FAISS on every resume search.
-
-GLOBAL_INDEX_DIR = os.path.join("artifacts", "global_index")
-GLOBAL_MAX_ITEMS = 5000  # global pool size cap (per area/timeframe)
-GLOBAL_TOPK = 1200       # how many candidates to pull from FAISS before term filtering
-
-
-def _global_dir(area_id: int, period_days: int) -> str:
-    return os.path.join(GLOBAL_INDEX_DIR, f"area_{int(area_id)}", f"days_{int(period_days)}")
-
-
-def _global_meta_path(area_id: int, period_days: int) -> str:
-    return os.path.join(_global_dir(area_id, period_days), "meta.pkl")
-
-
-def _global_faiss_path(area_id: int, period_days: int) -> str:
-    return os.path.join(_global_dir(area_id, period_days), "faiss.index")
-
-
-def _global_is_stale(area_id: int, period_days: int, update_hours: int) -> bool:
-    meta_p = _global_meta_path(area_id, period_days)
-    idx_p = _global_faiss_path(area_id, period_days)
-    if not (os.path.exists(meta_p) and os.path.exists(idx_p)):
-        return True
-    try:
-        mtime = min(os.path.getmtime(meta_p), os.path.getmtime(idx_p))
-        age_s = (datetime.now(timezone.utc).timestamp() - mtime)
-        return age_s >= (int(update_hours) * 3600)
-    except Exception:
-        return True
-
-
-def _item_to_row(it: dict) -> dict:
-    vid = str(it.get("id", "")).strip()
-    title = (it.get("name") or "").strip()
-
-    emp = it.get("employer") or {}
-    employer = emp.get("name", "") if isinstance(emp, dict) else ""
-
-    schedule = it.get("schedule") or {}
-    working_mode = schedule.get("name", "") if isinstance(schedule, dict) else ""
-
-    snippet = it.get("snippet") or {}
-    duties = (snippet.get("responsibility") or "").strip() if isinstance(snippet, dict) else ""
-    skills = (snippet.get("requirement") or "").strip() if isinstance(snippet, dict) else ""
-
-    salary_text = _salary_to_text(it.get("salary"))
-
-    row = {
-        COL_JOB_ID: vid,
-        COL_WORKPLACE: employer,
-        COL_MODE: working_mode,
-        COL_SALARY: salary_text,
-        COL_POSITION: title,
-        COL_DUTIES: duties,
-        COL_SKILLS: skills,
-        COL_DESC: "",
-        "alternate_url": it.get("alternate_url", "") or "",
-        "published_at": it.get("published_at", "") or "",
-    }
-    row["job_text"] = _job_text(pd.Series(row))
-    return row
-
-
 def _build_embeddings_for_df(df: pd.DataFrame, model: SentenceTransformer) -> np.ndarray:
-    dim = model.get_sentence_embedding_dimension()
-    embs = np.zeros((len(df), dim), dtype=np.float32)
+    embs = []
+    for _, r in df.iterrows():
+        vid = str(r.get(COL_JOB_ID, "")).strip()
+        if not vid:
+            embs.append(np.zeros((model.get_sentence_embedding_dimension(),), dtype=np.float32))
+            continue
 
-    missing_texts = []
-    missing_idx = []
-    for i, row in df.iterrows():
-        vid = str(row[COL_JOB_ID])
         cached = get_embedding(vid, MODEL_NAME)
         if cached is not None:
-            embs[i] = cached
-        else:
-            missing_idx.append(i)
-            missing_texts.append(str(row["job_text"] or ""))
-
-    if missing_texts:
-        new_emb = model.encode(
-            missing_texts,
-            batch_size=64,
-            show_progress_bar=False,
-            normalize_embeddings=True,
-        )
-        new_emb = np.asarray(new_emb, dtype=np.float32)
-
-        for j, i in enumerate(missing_idx):
-            embs[i] = new_emb[j]
-            put_embedding(str(df.loc[i, COL_JOB_ID]), MODEL_NAME, new_emb[j])
-
-    denom = np.linalg.norm(embs, axis=1, keepdims=True) + 1e-12
-    return embs / denom
-
-
-def _build_global_index(area_id: int, period_days: int) -> pd.DataFrame:
-    items = fetch_vacancies(
-        text=None,
-        area=int(area_id),
-        max_items=int(GLOBAL_MAX_ITEMS),
-        per_page=50,
-        period_days=int(period_days),
-        order_by="publication_time",
-    )
-
-    rows = []
-    for it in items:
-        vid = str(it.get("id", "")).strip()
-        if not vid:
+            embs.append(cached.astype(np.float32))
             continue
-        rows.append(_item_to_row(it))
 
-    meta_df = pd.DataFrame(rows)
-    if meta_df.empty:
-        return meta_df
+        txt = str(r.get("job_text", "") or "")
+        vec = model.encode([txt], normalize_embeddings=True)
+        vec = np.asarray(vec, dtype=np.float32)[0]
+        put_embedding(vid, MODEL_NAME, vec)
+        embs.append(vec)
 
-    model = SentenceTransformer(MODEL_NAME)
-    job_embs = _build_embeddings_for_df(meta_df, model)
-
-    import faiss  # local import
-
-    d = job_embs.shape[1]
-    index = faiss.IndexFlatIP(d)
-    index.add(job_embs.astype(np.float32))
-
-    out_dir = _global_dir(area_id, period_days)
-    os.makedirs(out_dir, exist_ok=True)
-    faiss.write_index(index, _global_faiss_path(area_id, period_days))
-
-    with open(_global_meta_path(area_id, period_days), "wb") as f:
-        pickle.dump(meta_df, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-    return meta_df
+    return np.vstack(embs).astype(np.float32)
 
 
-def _load_global_meta(area_id: int, period_days: int) -> pd.DataFrame | None:
-    p = _global_meta_path(area_id, period_days)
-    if not os.path.exists(p):
-        return None
-    try:
-        with open(p, "rb") as f:
-            df = pickle.load(f)
-        if isinstance(df, pd.DataFrame):
-            return df
-        return None
-    except Exception:
-        return None
-
-
-def _load_global_faiss(area_id: int, period_days: int):
-    p = _global_faiss_path(area_id, period_days)
-    if not os.path.exists(p):
-        return None
-    import faiss
-    try:
-        return faiss.read_index(p)
-    except Exception:
-        return None
-
-
-def _ensure_global_index(area_id: int, period_days: int, update_hours: int) -> pd.DataFrame | None:
-    if _global_is_stale(area_id, period_days, update_hours):
-        with st.spinner("Обновляем глобальный индекс вакансий (ускорение)..."):
-            try:
-                return _build_global_index(area_id, period_days)
-            except Exception as e:
-                st.warning(f"Не удалось обновить глобальный индекс: {e}")
-                return _load_global_meta(area_id, period_days)
-    return _load_global_meta(area_id, period_days)
-
-
-def _rank_from_global_index(
-    area_id: int,
-    period_days: int,
-    update_hours: int,
-    resume_text: str,
-    terms: List[str],
-) -> pd.DataFrame | None:
-    meta_df = _ensure_global_index(area_id, period_days, update_hours)
-    index = _load_global_faiss(area_id, period_days)
-    if meta_df is None or index is None or meta_df.empty:
-        return None
-
-    model = SentenceTransformer(MODEL_NAME)
-    q = model.encode([resume_text], normalize_embeddings=True)
-    q = np.asarray(q, dtype=np.float32)
-
-    topk = min(int(GLOBAL_TOPK), len(meta_df))
-    scores, idxs = index.search(q, topk)
-
-    cand = meta_df.iloc[idxs[0]].copy().reset_index(drop=True)
-    cand["similarity_score"] = scores[0].astype(float)
-
-    # Post-filter by chosen TF-IDF terms (keeps UX semantics).
-    tnorm = [t.lower() for t in terms if t.strip()]
-    if tnorm:
-        def _has_term(s: str) -> bool:
-            s = (s or "").lower()
-            return any(t in s for t in tnorm)
-
-        mask = cand["job_text"].astype(str).apply(_has_term)
-        filtered = cand[mask].copy()
-        if len(filtered) >= 50:
-            cand = filtered
-
-    cand = cand.sort_values("similarity_score", ascending=False).reset_index(drop=True)
-    return cand
-
-
-def _rank_with_faiss(job_embs: np.ndarray, query_vec: np.ndarray) -> np.ndarray:
-    import faiss
-    d = job_embs.shape[1]
-    index = faiss.IndexFlatIP(d)
-    index.add(job_embs.astype(np.float32))
-    scores, idx = index.search(query_vec.astype(np.float32), job_embs.shape[0])
-    score_arr = np.zeros((job_embs.shape[0],), dtype=np.float32)
-    score_arr[idx[0]] = scores[0]
-    return score_arr
-
-
-# ---------- auth ----------
-def auth_screen():
-    st.markdown("## Вход / Регистрация")
-    t1, t2 = st.tabs(["Вход", "Регистрация"])
-    with t1:
-        email = st.text_input("Email", key="login_email")
-        password = st.text_input("Пароль", type="password", key="login_password")
-        if st.button("Войти", use_container_width=True):
-            user = authenticate(email, password)
-            if not user:
-                st.error("Неверный email или пароль.")
-            else:
-                tok = create_session(int(user["id"]), days_valid=30)
-                st.query_params["token"] = tok
-                st.session_state.user = user
-                st.rerun()
-    with t2:
-        email_r = st.text_input("Email", key="reg_email")
-        p1 = st.text_input("Пароль (мин. 6 символов)", type="password", key="reg_password")
-        p2 = st.text_input("Повторите пароль", type="password", key="reg_password2")
-        if st.button("Создать аккаунт", use_container_width=True):
-            if p1 != p2:
-                st.error("Пароли не совпадают.")
-            else:
-                ok, msg = create_user(email_r, p1)
-                st.success(msg) if ok else st.error(msg)
-
-
-if st.session_state.user is None:
-    auth_screen()
-    st.stop()
-
-
-# ---------- main ----------
-user_id = int(st.session_state.user["id"])
-
-@st.cache_data(ttl=24 * 60 * 60, show_spinner=False)
-def _areas_cached():
-    tree = fetch_areas_tree()
-    regions, cities_by_region_id = list_regions_and_cities(tree, country_name="Россия")
-    return regions, cities_by_region_id
-
-regions, cities_by_region_id = _areas_cached()
-
-# defaults: Novosibirsk region
-default_region_name = "Новосибирская область"
-region_names = [r["name"] for r in regions]
-default_region_idx = region_names.index(default_region_name) if default_region_name in region_names else 0
-
-st.sidebar.markdown("### Параметры")
-region_name = st.sidebar.selectbox("Регион", region_names, index=default_region_idx)
-region = next(r for r in regions if r["name"] == region_name)
-region_id = int(region["id"])
-
-cities = cities_by_region_id.get(region_id, [])
-city_names = [c["name"] for c in cities] if cities else []
-default_city = "Новосибирск"
-city_idx = city_names.index(default_city) if default_city in city_names else 0
-city_name = st.sidebar.selectbox("Город", city_names, index=city_idx) if city_names else None
-area_id = int(next(c["id"] for c in cities if c["name"] == city_name)) if city_name else region_id
-
-period_days = st.sidebar.selectbox("Период вакансий (дни)", [14, 30, 60, 90, 180], index=2)
-update_hours = st.sidebar.selectbox("Авто-обновление (часы)", [6, 12, 24], index=2)
-
-st.sidebar.markdown("---")
-
-# logout
-if st.sidebar.button("Выйти", use_container_width=True):
-    tok = st.query_params.get("token", "")
-    if tok:
-        delete_session(tok)
-    st.query_params.clear()
-    st.session_state.user = None
-    st.rerun()
-
-# ---------- resume ----------
-st.sidebar.markdown("### Резюме")
-resumes = list_resumes(user_id)
-resume_source = st.sidebar.radio("Источник резюме", ["No resume", "Upload PDF", "Created resume"], index=0)
-
-resume_text = ""
-has_resume = False
-rid = None
-
-if resume_source == "Upload PDF":
-    up = st.sidebar.file_uploader("PDF резюме", type=["pdf"])
-    if up is not None:
-        resume_text = extract_text_from_pdf(up.read())
-        has_resume = bool(resume_text.strip())
-elif resume_source == "Created resume":
-    if resumes:
-        labels = [f'{r["id"]}: {r["name"]}' for r in resumes]
-        sel = st.sidebar.selectbox("Выберите резюме", labels)
-        rid = int(sel.split(":")[0])
-        r = next(x for x in resumes if int(x["id"]) == rid)
-        resume_text = r["text"]
-        has_resume = bool(resume_text.strip())
-        st.session_state["selected_resume_label"] = r["name"]
-    else:
-        st.sidebar.info("Нет сохраненных резюме.")
-
-# TF-IDF terms auto-update when resume changes (no HH calls)
-if has_resume:
-    rh = hashlib.sha256(resume_text.encode("utf-8", errors="ignore")).hexdigest()
-    if rh != st.session_state.resume_hash_for_terms:
-        auto_terms = extract_terms(resume_text, top_k=TERMS_MAX)
-        auto_terms = auto_terms[:TERMS_MAX]
-        if len(auto_terms) < TERMS_MIN:
-            auto_terms = list(dict.fromkeys(auto_terms + ["python", "sql"]))[:TERMS_MIN]
-        st.session_state.terms_text = "\n".join(auto_terms)
-        st.session_state.resume_hash_for_terms = rh
-
-    st.sidebar.markdown("### Термины (можно редактировать)")
-    st.session_state.terms_text = st.sidebar.text_area("TF-IDF термины", value=st.session_state.terms_text, height=140)
-
-# manual query button
-do_search = st.sidebar.button("Поиск", use_container_width=True)
-
-# ---------- header ----------
-st.title("💼 HH.ru Job Recommender")
-st.caption("По умолчанию показываем 500 вакансий. Все последующие запросы к HH — только по кнопке **Поиск**.")
-
-favorites = set(list_favorites(user_id))
-
-
-# ---------- data fetch helpers ----------
-@st.cache_data(ttl=60 * 60, show_spinner=False)
-def _fetch_default_startup(area_id: int, period_days: int, nonce: int):
-    return fetch_vacancies(
-        text=None,
-        area=int(area_id),
-        max_items=int(DEFAULT_STARTUP_LIMIT),
-        per_page=50,
-        period_days=int(period_days),
-        order_by="publication_time",
-    )
+def _rank_with_faiss(job_embs: np.ndarray, query_emb: np.ndarray) -> np.ndarray:
+    # brute cosine since job_embs already normalized
+    job_embs = job_embs.astype(np.float32)
+    query_emb = query_emb.astype(np.float32)
+    return (job_embs @ query_emb[0]).astype(np.float32)
 
 
 @st.cache_data(ttl=60 * 60, show_spinner=False)
-def _fetch_term(area_id: int, term: str, max_items: int, period_days: int, nonce: int):
+def _fetch_term(area_id: int, term: str, per_term: int, period_days: int, refresh_nonce: int) -> List[dict]:
     return fetch_vacancies(
         text=term,
-        area=int(area_id),
-        max_items=int(max_items),
-        per_page=50,
-        period_days=int(period_days),
-        order_by="relevance",
+        area=area_id,
+        max_items=per_term,
+        per_page=min(50, per_term),
+        period_days=period_days,
+        order_by="publication_time",
     )
 
 
-def _render_jobs(df: pd.DataFrame, favorites_set: set, show_scores: bool):
-    if df is None or df.empty:
-        st.info("Нет вакансий для отображения.")
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def _fetch_default_startup(area_id: int, period_days: int, refresh_nonce: int) -> List[dict]:
+    return fetch_vacancies(
+        text=None,
+        area=area_id,
+        max_items=DEFAULT_STARTUP_LIMIT,
+        per_page=50,
+        period_days=period_days,
+        order_by="publication_time",
+    )
+
+
+@st.cache_data(ttl=60 * 60, show_spinner=False)
+def _fetch_details(vacancy_id: str) -> Dict:
+    return vacancy_details(vacancy_id)
+
+
+def _details_cached(details_cache: Dict[str, Dict], vacancy_id: str) -> Dict:
+    vid = str(vacancy_id).strip()
+    if not vid:
+        return {}
+    if vid in details_cache:
+        return details_cache[vid]
+    try:
+        d = _fetch_details(vid)
+    except Exception:
+        d = {}
+    if len(details_cache) >= DETAILS_CACHE_MAX:
+        # drop an arbitrary item to keep bounded
+        details_cache.pop(next(iter(details_cache)))
+    details_cache[vid] = d
+    return d
+
+
+def _extract_skills_from_full(full: Dict) -> List[str]:
+    # HH details: key_skills is list of dicts {"name": "..."}
+    ks = full.get("key_skills") or []
+    out = []
+    if isinstance(ks, list):
+        for x in ks:
+            if isinstance(x, dict) and x.get("name"):
+                out.append(str(x["name"]).strip())
+    return out[:20]
+
+
+def _extract_description_from_full(full: Dict) -> str:
+    desc = full.get("description") or ""
+    return _strip_html(str(desc))
+
+
+def _ensure_session_state_defaults():
+    if "user" not in st.session_state:
+        st.session_state.user = None
+
+    if "page" not in st.session_state:
+        st.session_state.page = 1
+        st.session_state.last_fetch_at = datetime.now(timezone.utc)
+    if "page_size" not in st.session_state:
+        st.session_state.page_size = 20
+
+    if "resume_source" not in st.session_state:
+        st.session_state.resume_source = "None"
+    if "pdf_text" not in st.session_state:
+        st.session_state.pdf_text = ""
+
+    if "details_cache" not in st.session_state:
+        st.session_state.details_cache = {}
+
+    if "refresh_nonce" not in st.session_state:
+        st.session_state.refresh_nonce = 0
+
+    if "terms_text" not in st.session_state:
+        st.session_state.terms_text = ""
+
+    if "selected_resume_id" not in st.session_state:
+        st.session_state.selected_resume_id = None
+    if "selected_resume_label" not in st.session_state:
+        st.session_state.selected_resume_label = None
+
+    if "last_results_df" not in st.session_state:
+        st.session_state.last_results_df = pd.DataFrame()
+
+    if "last_global_refresh_nonce" not in st.session_state:
+        st.session_state.last_global_refresh_nonce = -1
+
+
+_ensure_session_state_defaults()
+
+# ---------- auth ----------
+def _auth_block():
+    st.title("💼 HH Job Recommender")
+
+    token = st.session_state.get("session_token", None)
+    user = None
+    if token:
+        user = get_user_by_token(token)
+
+    if user:
+        st.session_state.user = user
         return
 
-    page_size = 25
-    total = len(df)
-    pages = max(1, math.ceil(total / page_size))
-
-    cols = st.columns([1, 2, 1])
-    with cols[0]:
-        if st.button("⬅️", disabled=(st.session_state.page <= 1)):
-            st.session_state.page = max(1, st.session_state.page - 1)
-    with cols[1]:
-        st.write(f"Страница {st.session_state.page} / {pages} — всего {total}")
-    with cols[2]:
-        if st.button("➡️", disabled=(st.session_state.page >= pages)):
-            st.session_state.page = min(pages, st.session_state.page + 1)
-
-    start = (st.session_state.page - 1) * page_size
-    end = min(total, start + page_size)
-    subset = df.iloc[start:end]
-
-    for _, row in subset.iterrows():
-        vid = str(row[COL_JOB_ID])
-        title = str(row.get(COL_POSITION, ""))
-        employer = str(row.get(COL_WORKPLACE, ""))
-        url = str(row.get("alternate_url", ""))
-
-        left, right = st.columns([6, 1])
-        with left:
-            st.markdown(f"**{title}** — {employer}")
-            if url:
-                st.markdown(url)
-            if show_scores and "similarity_score" in row and pd.notna(row.get("similarity_score")):
-                st.caption(f"Score: {float(row.get('similarity_score')):.4f}")
-        with right:
-            if vid in favorites_set:
-                if st.button("★", key=f"fav_rm_{vid}"):
-                    remove_favorite(user_id, vid)
-                    st.rerun()
+    tab1, tab2 = st.tabs(["Login", "Register"])
+    with tab1:
+        email = st.text_input("Email", key="login_email")
+        password = st.text_input("Password", type="password", key="login_password")
+        if st.button("Login"):
+            u = authenticate(email, password)
+            if u:
+                token = create_session(u["id"])
+                st.session_state.session_token = token
+                st.session_state.user = u
+                st.success("Logged in")
+                st.rerun()
             else:
-                if st.button("☆", key=f"fav_add_{vid}"):
-                    add_favorite(user_id, vid)
-                    st.rerun()
+                st.error("Invalid credentials")
 
-        with st.expander("Описание"):
-            if vid not in st.session_state.details_cache:
-                st.session_state.details_cache[vid] = _fetch_details(vid)
-            st.write(_truncate(st.session_state.details_cache[vid], 2500))
-
-
-# ---------- DEFAULT VIEW (startup / no click) ----------
-if not do_search and st.session_state.last_results_df is None:
-    with st.spinner("Загружаем дефолтные вакансии (без эмбеддингов)..."):
-        items = _fetch_default_startup(int(area_id), int(period_days), int(st.session_state.refresh_nonce))
-        df0 = _items_to_df(items)
-    df0["similarity_score"] = pd.NA
-    st.session_state.last_results_df = df0
-    st.session_state.last_results_meta = {"mode": "default_latest", "area_id": int(area_id)}
-    st.session_state.last_fetch_at = datetime.now(timezone.utc)
+    with tab2:
+        email = st.text_input("Email", key="reg_email")
+        password = st.text_input("Password", type="password", key="reg_password")
+        if st.button("Create account"):
+            try:
+                create_user(email, password)
+                st.success("Account created. Please login.")
+            except Exception as e:
+                st.error(f"Could not create user: {e}")
 
 
-# ---------- ACTION: manual search ----------
-if do_search:
-    st.session_state.details_cache = {}
-    st.session_state.refresh_nonce += 1
+if not st.session_state.user:
+    _auth_block()
+    st.stop()
 
-    if not has_resume:
-        with st.spinner("Загружаем вакансии по параметрам (без эмбеддингов)..."):
-            items = _fetch_default_startup(int(area_id), int(period_days), int(st.session_state.refresh_nonce))
-            df = _items_to_df(items)
-        df["similarity_score"] = pd.NA
-        st.session_state.last_results_df = df
-        st.session_state.last_results_meta = {"mode": "explicit_params", "area_id": int(area_id)}
-        st.session_state.last_fetch_at = datetime.now(timezone.utc)
-        st.session_state.page = 1
-    else:
-        terms = [t.strip() for t in st.session_state.terms_text.splitlines() if t.strip()]
-        terms = terms[:TERMS_MAX]
-        if len(terms) < TERMS_MIN:
-            terms = list(dict.fromkeys(terms + ["python", "sql"]))[:TERMS_MIN]
+user_id = int(st.session_state.user["id"])
 
-        st.write("**Термины для HH:**", ", ".join(terms))
+# ---------- sidebar ----------
+with st.sidebar:
+    st.markdown("## ⚙️ Настройки")
+    if st.button("Logout"):
+        token = st.session_state.get("session_token", None)
+        if token:
+            delete_session(token)
+        st.session_state.session_token = None
+        st.session_state.user = None
+        st.rerun()
 
-        with st.spinner("Ранжирование через глобальный индекс (FAISS, быстро)..."):
-            fast_df = _rank_from_global_index(
-                area_id=int(area_id),
-                period_days=int(period_days),
-                update_hours=int(update_hours),
-                resume_text=resume_text,
-                terms=terms,
-            )
+    st.markdown("---")
 
-        if fast_df is not None and not fast_df.empty:
-            df = fast_df
+    areas_tree = fetch_areas_tree()
+    regions, cities = list_regions_and_cities(areas_tree)
+
+    region = st.selectbox("Регион", regions, index=min(0, len(regions) - 1), key="region_sel")
+    city_list = cities.get(region, [])
+    city = st.selectbox("Город", city_list if city_list else ["—"], key="city_sel")
+
+    # city -> area_id
+    # In hh_areas.py, cities list contains tuples? If list is strings, we map by searching tree.
+    # The helper already provides city name; we will pass it back through hh_areas search
+    # For stability, keep existing behavior (it worked in main).
+    # We keep a text input fallback if not found.
+    area_id = st.text_input("Area ID (если нужно)", value="", key="area_id_txt")
+
+    period_days = st.selectbox("Период (дни)", [7, 14, 30, 60], index=3, key="period_days_sel")
+    page_size = st.selectbox("Размер страницы", [10, 20, 30, 50], index=1, key="page_size_sel")
+    st.session_state.page_size = int(page_size)
+
+    if st.button("🔄 Обновить вакансии"):
+        st.session_state.refresh_nonce += 1
+        st.success("Обновление запрошено. Перезапустите поиск/ленту.")
+
+    st.markdown("---")
+    st.markdown("## 🧾 Резюме")
+
+    resumes = list_resumes(user_id)
+    resume_opts = ["— None —"] + [f'{r["id"]}: {r["name"]}' for r in resumes]
+    sel = st.selectbox("Выбрать резюме", resume_opts, index=0, key="resume_pick")
+
+    resume_source = st.radio("Источник", ["None", "Created resume", "PDF resume"], index=0, key="resume_source")
+
+    if resume_source == "Created resume":
+        if sel != "— None —":
+            rid = int(sel.split(":")[0])
+            st.session_state.selected_resume_id = rid
+            st.session_state.selected_resume_label = sel
+    elif resume_source == "PDF resume":
+        up = st.file_uploader("Загрузить PDF", type=["pdf"])
+        if up is not None:
+            try:
+                st.session_state.pdf_text = _read_pdf_text(up.read())
+                st.success("PDF прочитан")
+            except Exception as e:
+                st.error(f"Не удалось прочитать PDF: {e}")
+
+    st.markdown("---")
+    st.markdown("## 🔎 Термины (TF-IDF)")
+    if st.button("Extract terms"):
+        # extract from active resume
+        txt = ""
+        if resume_source == "Created resume" and st.session_state.get("selected_resume_id"):
+            rid = int(st.session_state.selected_resume_id)
+            rmatch = next((r for r in resumes if int(r["id"]) == rid), None)
+            if rmatch:
+                txt = rmatch.get("text", "") or ""
+        elif resume_source == "PDF resume":
+            txt = st.session_state.get("pdf_text", "") or ""
+        if not txt.strip():
+            st.warning("Сначала выберите/загрузите резюме")
         else:
-            # Fallback: old behavior (multi-query fetch -> embed -> FAISS) if global index is unavailable
-            with st.spinner("Fetching вакансий по терминам (multi-query)..."):
-                batches = [_fetch_term(int(area_id), term, PER_TERM, int(period_days), int(st.session_state.refresh_nonce)) for term in terms]
-                merged = _dedupe_merge(batches)
-                df = _items_to_df(merged)
+            terms = extract_terms(txt, top_k=TERMS_MAX)
+            st.session_state.terms_text = "\n".join(terms)
 
-            model = SentenceTransformer(MODEL_NAME)
-            with st.spinner("Эмбеддинги вакансий (reuse by vacancy_id) + FAISS ранжирование..."):
-                job_embs = _build_embeddings_for_df(df, model)
-                q = model.encode([resume_text], normalize_embeddings=True)
-                q = np.asarray(q, dtype=np.float32)
-                scores = _rank_with_faiss(job_embs, q)
-                df["similarity_score"] = scores
-                df = df.sort_values("similarity_score", ascending=False).reset_index(drop=True)
+    st.text_area("Термины (каждый с новой строки)", height=180, key="terms_text")
 
-        # ---- SAVE HISTORY (resume-based search) ----
-        try:
-            if resume_source == "Created resume":
-                resume_id_to_save = int(rid) if rid is not None else None
-                resume_key = f"rid:{resume_id_to_save}" if resume_id_to_save is not None else "rid:unknown"
-                resume_label = st.session_state.get("selected_resume_label")
+
+# ---------- area_id resolution ----------
+# keep the original behavior:
+# if user didn't supply area_id, try to infer by city name search in tree
+if not area_id.strip():
+    # best-effort find city id by name
+    # fetch_areas_tree provides dict structure; try to find matching city name
+    def _find_area_id(tree, name: str):
+        if not name or name == "—":
+            return None
+        name_l = name.strip().lower()
+
+        def walk(node):
+            if isinstance(node, dict):
+                if str(node.get("name", "")).strip().lower() == name_l and node.get("id") is not None:
+                    return int(node["id"])
+                for ch in node.get("areas", []) or []:
+                    r = walk(ch)
+                    if r is not None:
+                        return r
+            elif isinstance(node, list):
+                for x in node:
+                    r = walk(x)
+                    if r is not None:
+                        return r
+            return None
+
+        return walk(tree)
+
+    inferred = _find_area_id(areas_tree, city)
+    if inferred is not None:
+        area_id = str(inferred)
+    else:
+        # fallback to Novosibirsk if nothing found (user requirement earlier)
+        area_id = "4"  # Novosibirsk area_id on HH is commonly 4
+
+# ---------- favorites ----------
+favorites = list_favorites(user_id)
+favorites_set = {str(x["job_id"]) for x in favorites}
+
+
+# ---------- timeline default from history ----------
+def _load_default_timeline_from_history(user_id: int, favorites_set: set) -> pd.DataFrame:
+    # Default timeline = ALL saved vacancies across last 2-3 saved searches,
+    # merged/deduped, using MOST RECENT search score per vacancy (see db.list_default_timeline).
+    rows = list_default_timeline(user_id=user_id, limit=5000)
+    if not rows:
+        return pd.DataFrame()
+
+    all_rows = []
+    for r in rows:
+        vid = str(r.get("vacancy_id", "")).strip()
+        if not vid:
+            continue
+        all_rows.append(
+            {
+                COL_JOB_ID: vid,
+                COL_WORKPLACE: r.get("employer", "") or "",
+                COL_MODE: r.get("working_mode", "") or "",
+                COL_SALARY: r.get("salary_text", "") or "",
+                COL_POSITION: r.get("title", "") or "",
+                COL_DUTIES: r.get("snippet_resp", "") or "",
+                COL_SKILLS: r.get("snippet_req", "") or "",
+                COL_DESC: "",
+                "alternate_url": r.get("url", "") or "",
+                "published_at": r.get("published_at", "") or "",
+                "similarity_score": r.get("similarity_score", pd.NA),
+            }
+        )
+
+    df = pd.DataFrame(all_rows)
+    if len(df):
+        df["job_text"] = df.apply(_job_text, axis=1)
+    else:
+        df["job_text"] = ""
+    return df
+
+
+# ---------- main layout ----------
+st.title("💼 HH Job Recommender")
+
+colA, colB = st.columns([1.2, 1])
+
+with colA:
+    st.markdown("### Результаты")
+with colB:
+    st.markdown("### История / Избранное")
+
+# ---------- saved searches list ----------
+saved = list_saved_searches(user_id)
+latest = get_latest_saved_search(user_id)
+
+with colB:
+    st.markdown("**Сохраненные поиски (последние 2-3):**")
+    if saved:
+        for s in saved:
+            sid = int(s["id"])
+            label = s.get("resume_label") or s.get("resume_key")
+            st.write(f'• #{sid} — {label} — area={s["area_id"]} days={s["timeframe_days"]}')
+            c1, c2 = st.columns([1, 1])
+            with c1:
+                if st.button(f"🗑️ Удалить #{sid}", key=f"del_search_{sid}"):
+                    delete_saved_search(sid)
+                    st.rerun()
+            with c2:
+                st.caption(f'last_ranked={s.get("last_ranked_at") or "—"} | last_refresh={s.get("last_refresh_at") or "—"}')
+    else:
+        st.info("Нет сохраненных поисков. Выполните поиск с резюме, чтобы сохранить результаты.")
+
+# ---------- compute resume_text + terms ----------
+resume_text = ""
+resume_source = st.session_state.get("resume_source", "None")
+
+if resume_source == "Created resume" and st.session_state.get("selected_resume_id"):
+    rid = int(st.session_state.selected_resume_id)
+    rmatch = next((r for r in resumes if int(r["id"]) == rid), None)
+    if rmatch:
+        resume_text = str(rmatch.get("text", "") or "")
+elif resume_source == "PDF resume":
+    resume_text = str(st.session_state.get("pdf_text", "") or "")
+
+terms = [t.strip() for t in st.session_state.terms_text.splitlines() if t.strip()]
+terms = terms[:TERMS_MAX]
+if len(terms) < TERMS_MIN:
+    terms = list(dict.fromkeys(terms + ["python", "sql"]))[:TERMS_MIN]
+
+
+# ---------- default behavior (no resume): show history timeline if exists, else show city+time feed ----------
+try:
+    _now = _now_utc()
+    last_fetch_at = st.session_state.get("last_fetch_at", _now - timedelta(days=365))
+
+    need_refresh = (_now - last_fetch_at) > timedelta(minutes=10) or (st.session_state.refresh_nonce > 0)
+
+    if need_refresh:
+        if resume_text.strip():
+            # resume-based search: run ranking and save search results
+            st.write("**Термины для HH:**", ", ".join(terms))
+
+            with st.spinner("Глобальный индекс: обновление/загрузка..."):
+                # If user clicked refresh button, refresh_nonce changes; force index refresh for this (area, days).
+                nonce = int(st.session_state.get("refresh_nonce", 0))
+                last_nonce = int(st.session_state.get("last_global_refresh_nonce", -1))
+                force_refresh = nonce != last_nonce
+                st.session_state.last_global_refresh_nonce = nonce
+
+                did_refresh, msg = refresh_global_index(
+                    GlobalIndexConfig(area_id=int(area_id), period_days=int(period_days), max_items=5000, per_page=50),
+                    force=force_refresh,
+                    min_hours_between_refresh=6,
+                )
+                st.caption(msg)
+
+                g_index = load_global_index(int(area_id), int(period_days))
+
+                # If index doesn't exist yet (first run), force refresh once.
+                if g_index is None:
+                    did_refresh, msg = refresh_global_index(
+                        GlobalIndexConfig(area_id=int(area_id), period_days=int(period_days), max_items=5000, per_page=50),
+                        force=True,
+                        min_hours_between_refresh=0,
+                    )
+                    st.caption(msg)
+                    g_index = load_global_index(int(area_id), int(period_days))
+
+            if g_index is None:
+                st.error("Не удалось загрузить глобальный индекс (проверьте HH API / User-Agent и права на запись в artifacts).")
+                df = pd.DataFrame()
             else:
-                fp = hashlib.sha256((resume_text or "").encode("utf-8", errors="ignore")).hexdigest()
-                resume_id_to_save = None
-                resume_key = f"pdf:{fp}"
-                resume_label = "PDF"
+                model = SentenceTransformer(MODEL_NAME)
+                with st.spinner("FAISS поиск по глобальному индексу + пост-фильтрация..."):
+                    q = model.encode([resume_text], normalize_embeddings=True)
+                    q = np.asarray(q, dtype=np.float32)
 
-            search_id, created_new = create_or_get_saved_search(
-                user_id=user_id,
-                resume_key=resume_key,
-                area_id=int(area_id),
-                timeframe_days=int(period_days),
-                resume_id=resume_id_to_save,
-                resume_label=resume_label,
-                update_interval_hours=int(update_hours),
-                refresh_window_hours=int(update_hours),
-            )
+                    scores, ids = search_global_index(g_index, q, top_k=1200)
+                    vid_list = [str(int(i)) for i in ids if int(i) != -1]
 
-            enforce_saved_search_limit(user_id=user_id, keep_n=3)
+                    rows = get_global_vacancies_by_ids(vid_list)
 
-        except Exception as e:
-            st.warning(f"Не удалось сохранить историю поиска: {e}")
-            search_id = None
+                    out_rows = []
+                    score_map = {str(int(i)): float(s) for s, i in zip(scores, ids) if int(i) != -1}
+                    for r in rows:
+                        vid = str(r.get("vacancy_id", "")).strip()
+                        if not vid:
+                            continue
+                        out_rows.append(
+                            {
+                                COL_JOB_ID: vid,
+                                COL_WORKPLACE: r.get("employer", "") or "",
+                                COL_MODE: "",
+                                COL_SALARY: r.get("salary_text", "") or "",
+                                COL_POSITION: r.get("title", "") or "",
+                                COL_DUTIES: r.get("snippet_resp", "") or "",
+                                COL_SKILLS: r.get("snippet_req", "") or "",
+                                COL_DESC: "",
+                                "alternate_url": r.get("url", "") or "",
+                                "published_at": r.get("published_at", "") or "",
+                                "similarity_score": score_map.get(vid, pd.NA),
+                            }
+                        )
 
-        if search_id is not None:
-            out_rows = []
-            for _r in df.to_dict(orient="records"):
-                out_rows.append(
-                    {
-                        "vacancy_id": str(_r.get(COL_JOB_ID, "")),
-                        "published_at": str(_r.get("published_at", "")),
-                        "title": str(_r.get(COL_POSITION, "")),
-                        "employer": str(_r.get(COL_WORKPLACE, "")),
-                        "url": str(_r.get("alternate_url", "")),
-                        "snippet_req": str(_r.get(COL_SKILLS, "")),
-                        "snippet_resp": str(_r.get(COL_DUTIES, "")),
-                        "salary_text": str(_r.get(COL_SALARY, "")),
-                        "score": None if pd.isna(_r.get("similarity_score")) else float(_r.get("similarity_score")),
-                    }
+                    df = pd.DataFrame(out_rows)
+                    if len(df):
+                        df["job_text"] = df.apply(_job_text, axis=1)
+                    else:
+                        df["job_text"] = ""
+
+                    # Preserve old "terms" semantics: post-filter results by term mentions.
+                    if len(df) and terms:
+                        pat = "|".join(re.escape(t.lower()) for t in terms if t)
+                        if pat:
+                            mask = df["job_text"].astype(str).str.lower().str.contains(pat, regex=True, na=False)
+                            filtered = df[mask].copy()
+                            if len(filtered) >= 15:
+                                df = filtered
+
+                    df = df.sort_values("similarity_score", ascending=False, na_position="last").reset_index(drop=True)
+
+            # ---- SAVE HISTORY (resume-based search) ----
+            try:
+                if resume_source == "Created resume":
+                    resume_id_to_save = int(rid)  # type: ignore[name-defined]
+                    resume_key = f"rid:{resume_id_to_save}"
+                    resume_label = st.session_state.get("selected_resume_label")
+                else:
+                    fp = hashlib.sha256((resume_text or "").encode("utf-8", errors="ignore")).hexdigest()
+                    resume_id_to_save = None
+                    resume_key = f"pdf:{fp}"
+                    resume_label = "PDF"
+
+                search_id, created_new = create_or_get_saved_search(
+                    user_id=user_id,
+                    resume_key=resume_key,
+                    area_id=int(area_id),
+                    timeframe_days=int(period_days),
+                    resume_id=resume_id_to_save,
+                    resume_label=resume_label,
+                    update_interval_hours=DEFAULT_UPDATE_INTERVAL_HOURS,
+                    refresh_window_hours=DEFAULT_REFRESH_WINDOW_HOURS,
                 )
 
-            try:
-                upsert_saved_search_results(search_id, out_rows)
+                # keep only last 2-3 searches
+                enforce_saved_search_limit(user_id=user_id, limit=SAVED_SEARCH_MAX)
+
+                if len(df):
+                    upsert_saved_search_results(search_id, df)
+
                 touch_ranked(search_id)
                 touch_refreshed(search_id)
-            except Exception as e:
-                st.warning(f"Не удалось сохранить результаты: {e}")
 
-        st.session_state.last_results_df = df
-        st.session_state.last_results_meta = {"mode": "resume_ranked", "area_id": int(area_id)}
-        st.session_state.last_fetch_at = datetime.now(timezone.utc)
-        st.session_state.page = 1
+            except Exception:
+                pass
 
+            st.session_state.last_results_df = df
 
-# ---------- AUTO-UPDATE ----------
-# Only applies to last shown results; if stale, refresh default-latest view.
-try:
-    if st.session_state.last_fetch_at is not None:
-        age = datetime.now(timezone.utc) - st.session_state.last_fetch_at
-        if age >= timedelta(hours=int(update_hours)) and st.session_state.last_results_meta is not None:
-            meta = st.session_state.last_results_meta
-            # auto-refresh only for default / explicit (no resume); for resume-based we expect manual "Поиск"
-            if meta.get("mode") in ("default_latest", "explicit_params"):
-                with st.spinner("Авто-обновление ленты (последние вакансии)..."):
-                    items = _fetch_default_startup(int(area_id), int(period_days), int(st.session_state.refresh_nonce))
-                    df0 = _items_to_df(items)
-                    df0["similarity_score"] = pd.NA
-                    st.session_state.last_results_df = df0
-                    st.session_state.last_results_meta = {"mode": meta.get("mode"), "area_id": int(area_id)}
-                    st.session_state.last_fetch_at = datetime.now(timezone.utc)
-                    st.session_state.page = 1
+        else:
+            # if no resume: prefer history timeline; otherwise show default feed for area+time
+            hist_df = _load_default_timeline_from_history(user_id, favorites_set)
+            if len(hist_df):
+                st.session_state.last_results_df = hist_df
+            else:
+                items = _fetch_default_startup(int(area_id), int(period_days), int(st.session_state.refresh_nonce))
+                _df = _items_to_df(items)
+                _df["similarity_score"] = pd.NA
+                st.session_state.last_results_df = _df
+
+        st.session_state.last_fetch_at = _now
 except Exception:
     pass
 
+df = st.session_state.last_results_df.copy()
 
 # ---------- render ----------
-df_show = st.session_state.last_results_df
-show_scores = df_show is not None and "similarity_score" in df_show.columns and df_show["similarity_score"].notna().any()
-_render_jobs(df_show, favorites, show_scores)
+def render_job(row: Dict, idx: int):
+    vid = str(row.get(COL_JOB_ID, "") or "")
+    title = str(row.get(COL_POSITION, "") or "Untitled")
+    company = str(row.get(COL_WORKPLACE, "") or "")
+    mode_ = str(row.get(COL_MODE, "") or "")
+    sal = str(row.get(COL_SALARY, "") or "")
+    url = str(row.get("alternate_url", "") or "")
+    pub = str(row.get("published_at", "") or "")
+    score = row.get("similarity_score", None)
 
-# global cleanup (keeps last 3 searches etc.)
-try:
-    enforce_limit_and_cleanup(user_id=user_id, keep_n=3)
-except Exception:
-    pass
+    pct = None
+    if score is not None and pd.notna(score):
+        pct = max(0, min(100, int(round(float(score) * 100))))
+
+    st.markdown('<div class="card">', unsafe_allow_html=True)
+
+    c1, c2, c3 = st.columns([4, 1.2, 1.2])
+    with c1:
+        st.markdown(f"### {idx}. {title}", unsafe_allow_html=True)
+        pills = []
+        if company:
+            pills.append(f'<span class="pill pill-strong">{company}</span>')
+        if mode_:
+            pills.append(f'<span class="pill">{mode_}</span>')
+        if sal:
+            pills.append(f'<span class="pill">{sal}</span>')
+        if pub:
+            pills.append(f'<span class="pill">{pub[:10]}</span>')
+        if url:
+            pills.append(f'<span class="pill"><a href="{url}" target="_blank">hh.ru</a></span>')
+        if pills:
+            st.markdown(" ".join(pills), unsafe_allow_html=True)
+
+        st.markdown(f"<div class='snippet'>{_snippet(row.get('job_text',''))}</div>", unsafe_allow_html=True)
+
+    with c2:
+        is_fav = vid in favorites_set
+        if is_fav:
+            if st.button("★", key=f"fav_{vid}"):
+                remove_favorite(user_id, vid)
+                st.rerun()
+        else:
+            if st.button("☆", key=f"fav_{vid}"):
+                add_favorite(user_id, vid)
+                st.rerun()
+
+    with c3:
+        if pct is not None:
+            st.metric("Match", f"{pct}%")
+        else:
+            st.write("")
+
+    # details expand
+    with st.expander("Подробнее"):
+        full = _details_cached(st.session_state.details_cache, vid)
+        if full:
+            desc = _extract_description_from_full(full)
+            skills = _extract_skills_from_full(full)
+            if skills:
+                st.markdown("**Навыки:**")
+                st.markdown(" ".join([f"<span class='skill-chip'>{_html.escape(s)}</span>" for s in skills]), unsafe_allow_html=True)
+            if desc:
+                st.markdown("**Описание:**")
+                st.write(desc)
+        else:
+            st.write("Нет подробностей (ошибка загрузки или лимиты HH).")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+
+with colA:
+    if df is None or not len(df):
+        st.info("Нет результатов. Выберите резюме и выполните поиск, либо обновите ленту.")
+    else:
+        total = len(df)
+        page_size = int(st.session_state.page_size)
+        pages = max(1, math.ceil(total / page_size))
+
+        # page controls
+        pcols = st.columns([1, 2, 2, 1])
+        with pcols[0]:
+            if st.button("◀"):
+                st.session_state.page = max(1, int(st.session_state.page) - 1)
+        with pcols[1]:
+            st.write(f"Page {st.session_state.page} / {pages}")
+        with pcols[2]:
+            st.slider("Перейти", min_value=1, max_value=pages, value=int(st.session_state.page), key="page_slider")
+            st.session_state.page = int(st.session_state.page_slider)
+        with pcols[3]:
+            if st.button("▶"):
+                st.session_state.page = min(pages, int(st.session_state.page) + 1)
+
+        start = (int(st.session_state.page) - 1) * page_size
+        end = min(total, start + page_size)
+        view = df.iloc[start:end].to_dict(orient="records")
+
+        for i, r in enumerate(view, start=start + 1):
+            render_job(r, i)
