@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import sqlite3
 import hashlib
@@ -5,13 +7,15 @@ import base64
 from typing import Any, Dict, List, Optional, Tuple
 from datetime import datetime, timezone, timedelta
 
+import pandas as pd  # ✅ needed because we use pd.DataFrame in annotations
+
 DB_PATH = os.getenv("DB_PATH", "app.db")
 
 
 def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
-    # Better concurrency behavior for Streamlit (safe even if not used heavily)
+    # Better concurrency behavior for Streamlit
     try:
         conn.execute("PRAGMA journal_mode=WAL;")
         conn.execute("PRAGMA synchronous=NORMAL;")
@@ -87,7 +91,7 @@ def init_db() -> None:
         """
     )
 
-    # ---- saved searches (per user history) ----
+    # ---- saved searches ----
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS saved_searches (
@@ -131,7 +135,7 @@ def init_db() -> None:
         """
     )
 
-    # ---- NEW: global vacancy metadata (for global index + fast UI) ----
+    # ---- global vacancy metadata ----
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS global_vacancies (
@@ -149,7 +153,7 @@ def init_db() -> None:
         """
     )
 
-    # ---- NEW: global index state ----
+    # ---- global index state ----
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS global_index_state (
@@ -163,7 +167,7 @@ def init_db() -> None:
     conn.close()
 
 
-# ---------------- Password hashing (stdlib: PBKDF2) ----------------
+# ---------------- Password hashing (PBKDF2) ----------------
 # stored format: pbkdf2_sha256$<iterations>$<salt_b64>$<hash_b64>
 
 def _pbkdf2_hash(password: str, salt: bytes, iterations: int = 200_000) -> bytes:
@@ -428,7 +432,6 @@ def delete_saved_search(search_id: int) -> None:
 
 
 def upsert_saved_search_results(search_id: int, df: pd.DataFrame) -> None:
-    # store top results for the search
     if df is None or not len(df):
         return
 
@@ -502,10 +505,6 @@ def touch_refreshed(search_id: int) -> None:
 
 
 def list_default_timeline(user_id: int, limit: int = 5000) -> List[Dict[str, Any]]:
-    """
-    Default timeline = merge saved_search_results across all saved searches of user.
-    Dedup by vacancy_id using the most recent updated_at for that vacancy (per user).
-    """
     conn = get_conn()
     cur = conn.cursor()
     cur.execute(
@@ -529,7 +528,7 @@ def list_default_timeline(user_id: int, limit: int = 5000) -> List[Dict[str, Any
     return rows
 
 
-# ------------ NEW: Global vacancy metadata ----------------
+# ------------ Global vacancies metadata ----------------
 def upsert_global_vacancies(rows: List[Dict[str, Any]]) -> None:
     conn = get_conn()
     cur = conn.cursor()
@@ -570,17 +569,7 @@ def upsert_global_vacancies(rows: List[Dict[str, Any]]) -> None:
     conn.close()
 
 
-def get_global_vacancy(vacancy_id: str) -> Optional[Dict[str, Any]]:
-    conn = get_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT * FROM global_vacancies WHERE vacancy_id=?", (str(vacancy_id),))
-    row = cur.fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-
 def get_global_vacancies_by_ids(vacancy_ids: List[str]) -> List[Dict[str, Any]]:
-    """Batch fetch global vacancy metadata preserving input order."""
     ids = [str(v).strip() for v in vacancy_ids if str(v).strip()]
     if not ids:
         return []
@@ -588,9 +577,8 @@ def get_global_vacancies_by_ids(vacancy_ids: List[str]) -> List[Dict[str, Any]]:
     conn = get_conn()
     cur = conn.cursor()
 
-    out: List[Dict[str, Any]] = []
-    chunk = 900
     found: Dict[str, Dict[str, Any]] = {}
+    chunk = 900
     for i in range(0, len(ids), chunk):
         part = ids[i: i + chunk]
         qs = ",".join("?" for _ in part)
@@ -601,6 +589,7 @@ def get_global_vacancies_by_ids(vacancy_ids: List[str]) -> List[Dict[str, Any]]:
 
     conn.close()
 
+    out: List[Dict[str, Any]] = []
     for vid in ids:
         r = found.get(str(vid))
         if r:
@@ -608,7 +597,7 @@ def get_global_vacancies_by_ids(vacancy_ids: List[str]) -> List[Dict[str, Any]]:
     return out
 
 
-# ---------------- NEW: Global index state ----------------
+# ---------------- Global index state ----------------
 def get_global_index_state(key: str) -> Optional[str]:
     conn = get_conn()
     cur = conn.cursor()
@@ -628,6 +617,39 @@ def set_global_index_state(key: str, value: str) -> None:
         ON CONFLICT(key) DO UPDATE SET value=excluded.value
         """,
         (str(key), str(value)),
+    )
+    conn.commit()
+    conn.close()
+
+
+# ---------------- Embeddings for embedding_store.py wrapper ----------------
+def get_embedding_db(vacancy_id: str, model_name: str) -> Optional[bytes]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT emb_blob FROM vacancy_embeddings WHERE vacancy_id=? AND model_name=?",
+        (str(vacancy_id), str(model_name)),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return row["emb_blob"]
+
+
+def put_embedding_db(vacancy_id: str, model_name: str, dim: int, emb_blob: bytes) -> None:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO vacancy_embeddings(vacancy_id, model_name, dim, emb_blob, updated_at)
+        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(vacancy_id, model_name) DO UPDATE SET
+          dim=excluded.dim,
+          emb_blob=excluded.emb_blob,
+          updated_at=CURRENT_TIMESTAMP
+        """,
+        (str(vacancy_id), str(model_name), int(dim), sqlite3.Binary(emb_blob)),
     )
     conn.commit()
     conn.close()
