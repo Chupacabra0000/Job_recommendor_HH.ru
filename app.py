@@ -444,9 +444,23 @@ if not resume_text.strip():
 # TF-IDF terms (editable)
 res_hash = hashlib.sha256(resume_text.encode("utf-8")).hexdigest()
 if st.session_state.resume_hash_for_terms != res_hash:
-    terms = extract_terms(resume_text, min_terms=TERMS_MIN, max_terms=TERMS_MAX)
-    st.session_state.terms_text = "\n".join(terms)
-    st.session_state.resume_hash_for_terms = res_hash
+    terms = extract_terms(resume_text, top_k=TERMS_MAX)  # <-- compatible with current tfidf_terms.py
+    terms = [t.strip() for t in terms if str(t).strip()]
+
+# enforce min/max without changing tfidf_terms.py
+if len(terms) < TERMS_MIN:
+    # pad with generic tech terms (won't break; user can edit anyway)
+    fallback = ["python", "sql", "аналитик", "разработчик", "backend", "data"]
+    for t in fallback:
+        if t not in terms:
+            terms.append(t)
+        if len(terms) >= TERMS_MIN:
+            break
+
+terms = terms[:TERMS_MAX]
+
+st.session_state.terms_text = "\n".join(terms)
+st.session_state.resume_hash_for_terms = res_hash
 
 st.caption("Ключевые термины (можно редактировать перед поиском):")
 terms_text = st.text_area("Термины", value=st.session_state.terms_text, height=120)
