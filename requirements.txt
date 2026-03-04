@@ -1,0 +1,9 @@
+streamlit
+pandas
+numpy
+sentence-transformers
+scikit-learn
+pymupdf
+pyarrow
+requests
+faiss-cpu
