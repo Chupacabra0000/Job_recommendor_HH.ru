@@ -396,10 +396,7 @@ def _term_match_mask(df: pd.DataFrame, terms: List[str]) -> pd.Series:
     mask = False
     for t in tset:
         mask = mask | jt.str.contains(re.escape(t), na=False)
-    return mask
-
-
-) or "")
+    return mask) or "")
 
 def _dedupe_merge(list_of_items: List[List[dict]]) -> List[dict]:
     seen = set()
