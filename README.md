@@ -1,16 +1,9 @@
 # Job Recommendation System (Streamlit)
 
 ## Setup
-1. Put your dataset as `JobsFE.csv` in the project root (same folder as `app.py`).
-2. Install dependencies:
+1. Install dependencies:
 ```bash
 pip install -r requirements.txt
-```
-
-## (Optional) Precompute embeddings
-This avoids recomputing embeddings on first run:
-```bash
-python build_index.py
 ```
 Artifacts are saved to `artifacts/`.
 
