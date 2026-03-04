@@ -550,6 +550,30 @@ def delete_saved_search(user_id: int, search_id: int) -> None:
     conn.commit()
     conn.close()
 
+def delete_saved_searches_for_resume(user_id: int, resume_id: int) -> List[int]:
+    """
+    Deletes all saved searches that belong to a specific stored resume (resume_id)
+    for the given user. Returns deleted search_ids.
+
+    Used when a resume is deleted to avoid keeping orphaned history + FAISS dirs.
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+
+    cur.execute(
+        "SELECT id FROM saved_searches WHERE user_id=? AND resume_id=? ORDER BY created_at DESC",
+        (int(user_id), int(resume_id)),
+    )
+    search_ids = [int(r["id"]) for r in cur.fetchall()]
+
+    for sid in search_ids:
+        cur.execute("DELETE FROM saved_search_results WHERE search_id=?", (int(sid),))
+        cur.execute("DELETE FROM saved_searches WHERE id=? AND user_id=?", (int(sid), int(user_id)))
+
+    conn.commit()
+    conn.close()
+    return search_ids
+
 
 def list_default_timeline(user_id: int, limit: int = 5000) -> List[Dict[str, Any]]:
     """
