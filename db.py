@@ -653,3 +653,51 @@ def put_embedding_db(vacancy_id: str, model_name: str, dim: int, emb_blob: bytes
     )
     conn.commit()
     conn.close()
+
+
+def delete_saved_searches_for_resume(resume_id: int, user_id: Optional[int] = None) -> None:
+    """
+    Delete saved searches (and their results) associated with a specific resume_id.
+    If user_id is provided, restrict deletion to that user (safer).
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+
+    if user_id is None:
+        cur.execute("SELECT id FROM saved_searches WHERE resume_id=?", (int(resume_id),))
+    else:
+        cur.execute(
+            "SELECT id FROM saved_searches WHERE resume_id=? AND user_id=?",
+            (int(resume_id), int(user_id)),
+        )
+
+    ids = [int(r["id"]) for r in cur.fetchall()]
+    for sid in ids:
+        cur.execute("DELETE FROM saved_search_results WHERE search_id=?", (sid,))
+        cur.execute("DELETE FROM saved_searches WHERE id=?", (sid,))
+
+    conn.commit()
+    conn.close()
+
+
+def delete_resume(resume_id: int, user_id: Optional[int] = None) -> None:
+    """
+    Delete a resume and cascade-delete saved searches/results that reference it.
+    If user_id is provided, restrict deletion to that user (safer).
+    """
+    # First delete dependent saved searches/results
+    delete_saved_searches_for_resume(resume_id, user_id=user_id)
+
+    conn = get_conn()
+    cur = conn.cursor()
+
+    if user_id is None:
+        cur.execute("DELETE FROM resumes WHERE id=?", (int(resume_id),))
+    else:
+        cur.execute(
+            "DELETE FROM resumes WHERE id=? AND user_id=?",
+            (int(resume_id), int(user_id)),
+        )
+
+    conn.commit()
+    conn.close()
