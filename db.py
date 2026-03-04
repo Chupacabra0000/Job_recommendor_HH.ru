@@ -1,4 +1,4 @@
-
+```python
 import sqlite3
 import os
 import base64
@@ -101,7 +101,7 @@ def init_db() -> None:
             FOREIGN KEY(user_id) REFERENCES users(id),
             FOREIGN KEY(resume_id) REFERENCES resumes(id)
         )
-"""
+        """
     )
     cur.execute(
         """
@@ -123,6 +123,37 @@ def init_db() -> None:
         """
     )
 
+    # =========================
+    # ADDED FOR GLOBAL PRE-INDEX
+    # =========================
+
+    # ---- global vacancy pool (for global FAISS index) ----
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS global_vacancies (
+            vacancy_id TEXT PRIMARY KEY,
+            area_id INTEGER NOT NULL,
+            published_at TEXT,
+            title TEXT,
+            employer TEXT,
+            url TEXT,
+            snippet_req TEXT,
+            snippet_resp TEXT,
+            salary_text TEXT,
+            updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+
+    # ---- key/value storage for global index refresh timestamps ----
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS global_index_state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
 
     # ---- migration: add resume_key to saved_searches (support PDF searches) ----
     try:
@@ -176,7 +207,6 @@ def init_db() -> None:
 
 # ---------------- Password hashing (stdlib: PBKDF2) ----------------
 # stored format: pbkdf2_sha256$<iterations>$<salt_b64>$<hash_b64>
-
 def _pbkdf2_hash(password: str, salt: bytes, iterations: int = 200_000) -> bytes:
     return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations)
 
@@ -704,7 +734,6 @@ def get_latest_saved_search(user_id: int) -> Optional[Dict[str, Any]]:
     return rows[0] if rows else None
 
 
-
 def create_or_get_saved_search(
     user_id: int,
     resume_key: str,
@@ -752,7 +781,16 @@ def create_or_get_saved_search(
         INSERT INTO saved_searches (user_id, resume_id, resume_key, resume_label, area_id, timeframe_days, update_interval_hours, refresh_window_hours)
         VALUES (?,?,?,?,?,?,?,?)
         """,
-        (int(user_id), resume_id, str(resume_key), resume_label, int(area_id), int(timeframe_days), int(update_interval_hours), int(refresh_window_hours)),
+        (
+            int(user_id),
+            resume_id,
+            str(resume_key),
+            resume_label,
+            int(area_id),
+            int(timeframe_days),
+            int(update_interval_hours),
+            int(refresh_window_hours),
+        ),
     )
     sid = int(cur.lastrowid)
     conn.commit()
@@ -1332,3 +1370,78 @@ def list_default_timeline(user_id: int, limit: int = 5000) -> List[Dict[str, Any
     rows = [dict(x) for x in cur.fetchall()]
     conn.close()
     return rows
+
+
+# =========================
+# ADDED FOR GLOBAL PRE-INDEX
+# =========================
+
+def upsert_global_vacancies(rows: List[Dict[str, Any]]) -> None:
+    """
+    rows entries must include:
+      vacancy_id, area_id, published_at, title, employer, url, snippet_req, snippet_resp, salary_text
+    """
+    conn = get_conn()
+    cur = conn.cursor()
+
+    for r in rows:
+        cur.execute(
+            """
+            INSERT INTO global_vacancies(
+                vacancy_id, area_id, published_at, title,
+                employer, url, snippet_req, snippet_resp, salary_text, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+            ON CONFLICT(vacancy_id) DO UPDATE SET
+                area_id=excluded.area_id,
+                published_at=excluded.published_at,
+                title=excluded.title,
+                employer=excluded.employer,
+                url=excluded.url,
+                snippet_req=excluded.snippet_req,
+                snippet_resp=excluded.snippet_resp,
+                salary_text=excluded.salary_text,
+                updated_at=CURRENT_TIMESTAMP
+            """,
+            (
+                str(r.get("vacancy_id")),
+                int(r.get("area_id")) if r.get("area_id") is not None else None,
+                r.get("published_at"),
+                r.get("title"),
+                r.get("employer"),
+                r.get("url"),
+                r.get("snippet_req"),
+                r.get("snippet_resp"),
+                r.get("salary_text"),
+            ),
+        )
+
+    conn.commit()
+    conn.close()
+
+
+def get_global_index_state(key: str) -> Optional[str]:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute("SELECT value FROM global_index_state WHERE key=?", (str(key),))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return None
+    return row["value"]
+
+
+def set_global_index_state(key: str, value: str) -> None:
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        INSERT INTO global_index_state(key, value)
+        VALUES (?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """,
+        (str(key), str(value)),
+    )
+    conn.commit()
+    conn.close()
+```
