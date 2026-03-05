@@ -10,8 +10,15 @@ from sentence_transformers import SentenceTransformer
 
 from hh_client import fetch_vacancies
 from embedding_store import init_store, get_embedding, put_embedding
-from db import init_db, upsert_global_vacancies, set_global_index_state, get_global_index_state
-from global_faiss_index import build_index, save_index
+from db import (
+    init_db,
+    upsert_global_vacancies,
+    set_global_index_state,
+    get_global_index_state,
+    global_has_vacancy_ids,              
+    set_global_index_state_if_newer,    
+)
+from global_faiss_index import build_index, save_index, load_index_and_ids 
 
 
 MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
