@@ -1,256 +1,288 @@
-# Job Recommender (HH.ru API Based)
 
-A resume-driven job recommendation system that fetches vacancies from **hh.ru** and ranks them using **semantic similarity (SentenceTransformers + FAISS)**.
 
-The system analyzes a user's resume, extracts meaningful terms with **TF-IDF**, retrieves relevant vacancies from **HH.ru API**, embeds them, and ranks them based on similarity to the resume.
+# HH.ru Semantic Job Recommender
 
-The application is built using **Python + Streamlit**.
+A **semantic job recommendation system** built for the HH.ru job platform using **vector search, transformer embeddings, and FAISS indexing**.
 
----
+Instead of traditional keyword matching, the system ranks job vacancies by **semantic similarity to a user's resume**, providing more relevant recommendations.
 
-# Main Features
+The project demonstrates **modern ML search architecture** including:
 
-### Resume-based job search
-
-Users can:
-
-• Upload a PDF resume
-• Create resumes inside the system
-• Use stored resumes for repeated searches
-
-The resume text is used to find the most relevant vacancies.
+* transformer embeddings
+* vector indexing
+* incremental indexing
+* memory-mapped vector storage
+* scalable search pipelines
 
 ---
 
-### TF-IDF keyword extraction
+# Demo Overview
 
-From the resume the system automatically extracts **6–10 most meaningful keywords**.
+Workflow:
 
-Example:
-
-Resume text → TF-IDF → keywords
-
-```
-python
-machine learning
-sql
-data analysis
-pandas
-etl
-```
-
-Each keyword is sent as a separate search query to **HH.ru API**.
-
----
-
-### Multi-query vacancy retrieval
-
-The system sends multiple API queries:
-
-```
-keyword1 → HH API
-keyword2 → HH API
-keyword3 → HH API
-...
-```
-
-Results are then:
-
-• merged
-• deduplicated
-• converted to structured format
-
----
-
-### Semantic ranking
-
-Vacancies are ranked using:
-
-```
+```id="dcyoaj"
+User Resume
+      │
+      ▼
+TF-IDF keyword extraction
+      │
+      ▼
+HH API vacancy retrieval
+      │
+      ▼
 SentenceTransformer embeddings
-+
-FAISS similarity search
+      │
+      ▼
+FAISS vector similarity search
+      │
+      ▼
+Ranked job recommendations
 ```
 
-Embedding model:
+---
 
-```
+# Key Features
+
+## Semantic job matching
+
+Resumes and job descriptions are converted into **vector embeddings** using:
+
+```id="frt9p6"
 sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 ```
 
-This supports **Russian and English resumes**.
+This allows the system to match **meaning**, not just keywords.
+
+Example:
+
+| Resume Skill         | Matching Vacancy |
+| -------------------- | ---------------- |
+| Python data analysis | Data engineer    |
+| Machine learning     | AI engineer      |
+| Backend APIs         | Python developer |
 
 ---
 
-### Lazy loading vacancy descriptions
+## Global vacancy vector index
 
-To improve performance:
+Vacancies are stored in a **shared global FAISS index**, allowing extremely fast search across thousands of jobs.
 
-• Full vacancy descriptions are **not fetched initially**
+Architecture:
 
-Instead:
+```id="ikxhb6"
+HH API
+   │
+   ▼
+Global Vacancy Store
+(SQLite metadata)
+   │
+   ▼
+Vector Store (memmap)
+   │
+   ▼
+FAISS Index
+```
 
-1. Top 10 results load full descriptions automatically
-2. Other results load descriptions only when the user expands them
-
-This dramatically reduces API calls.
+All users share the same index, making the system scalable.
 
 ---
 
-### Default vacancy timeline
+## Incremental index updates
 
-When the user opens the application:
+The system uses **Policy A indexing strategy**:
 
-The system shows a **timeline of all stored vacancies from past searches**.
+| Update type        | Description                               |
+| ------------------ | ----------------------------------------- |
+| Incremental update | Only new vacancies are embedded and added |
+| Full rebuild       | Performed every 24 hours                  |
 
-Rules:
-
-• Favorites always appear at the top
-• Remaining vacancies sorted by **similarity score**
-• Only **last 2–3 searches are stored** to prevent storage overflow
-
----
-
-### Favorites system
-
-Users can mark vacancies as favorites.
-
-Favorites:
-
-• Always appear **at the top of the timeline**
-• Persist across sessions
-• Are stored in the SQLite database
+This reduces compute costs while keeping the index fresh.
 
 ---
 
-### Smart vacancy storage
+## Memory-mapped vector storage
 
-To avoid excessive storage usage:
+Instead of storing embeddings in a database, vectors are stored in a **memory-mapped file**.
 
-Only **resume-based searches are stored**.
+Advantages:
 
-Search types:
+* extremely fast loading
+* minimal memory overhead
+* scalable to large vector sets
 
-| Search Type          | Stored |
-| -------------------- | ------ |
-| City + Time only     | ❌ No   |
-| City + Time + Resume | ✅ Yes  |
+Structure:
 
-Old searches are automatically removed.
+```id="r2ut87"
+artifacts/
+   vector_store/
+      model_name/
+         vecs.f32
+         ids.npy
+         meta.json
+```
+
+This allows fast retrieval of vectors without loading the entire dataset into memory.
 
 ---
 
-# Project Architecture
+## FAISS vector search
 
+Similarity search uses **FAISS** with inner-product similarity.
+
+Benefits:
+
+* extremely fast nearest-neighbor search
+* optimized for large vector datasets
+* widely used in production ML systems
+
+Typical search latency:
+
+```id="uifj0r"
+50-150 ms
 ```
-app.py
-```
-
-Main Streamlit interface.
-
-Handles:
-
-• login
-• resume upload
-• vacancy search
-• ranking
-• timeline display
 
 ---
 
-```
-hh_client.py
-```
+## Resume-driven multi-query retrieval
 
-Handles all communication with **HH.ru API**.
+The system extracts keywords from resumes using **TF-IDF**.
 
-Functions:
+Example:
 
-• vacancy search
-• vacancy detail retrieval
+```id="st5vfe"
+Resume:
+Python, SQL, machine learning
 
----
-
-```
-tfidf_terms.py
-```
-
-Extracts important keywords from resumes using TF-IDF.
-
----
-
-```
-embedding_store.py
-```
-
-Stores vacancy embeddings in SQLite.
-
-Prevents re-embedding the same vacancy multiple times.
-
----
-
-```
-faiss_search_index.py
-```
-
-Handles FAISS index creation and removal.
-
----
-
-```
-search_cleanup.py
-```
-
-Maintains storage limits:
-
-• keeps last 3 searches
-• deletes outdated FAISS indexes
-
----
-
-```
-hh_areas.py
-```
-
-Fetches regions and cities from HH API.
-
-Used to populate UI selectors.
-
----
-
-```
-db.py
-```
-
-Handles SQLite database operations:
-
-• users
-• resumes
-• favorites
-• saved searches
-• sessions
-
----
-
-# Requirements
-
-Python version:
-
-```
-Python 3.10+
-```
-
-Required libraries:
-
-```
-streamlit
-requests
-numpy
+Extracted search terms:
+python
+machine learning
+data analysis
 pandas
-scikit-learn
-faiss-cpu
-sentence-transformers
-pymupdf
+numpy
+sql
+```
+
+Each term triggers an HH API search and results are merged.
+
+---
+
+## Search history & timeline
+
+User searches are stored in a database.
+
+The system automatically generates a **default vacancy timeline** based on:
+
+* recent searches
+* resume similarity
+* favorites
+
+---
+
+## Favorites system
+
+Users can bookmark interesting vacancies.
+
+Favorites are prioritized in the recommendation view.
+
+---
+
+# System Architecture
+
+High-level architecture:
+
+```id="uzfy2t"
+                ┌───────────────┐
+                │   User Resume │
+                └───────┬───────┘
+                        │
+                        ▼
+           ┌────────────────────────┐
+           │ SentenceTransformer ML │
+           └────────────┬───────────┘
+                        │
+                        ▼
+                Resume Vector
+                        │
+                        ▼
+               FAISS Vector Search
+                        │
+                        ▼
+             Top Similar Vacancy IDs
+                        │
+                        ▼
+               SQLite Metadata Store
+                        │
+                        ▼
+                  Streamlit UI
+```
+
+---
+
+# Global Index Pipeline
+
+Vacancy indexing pipeline:
+
+```id="wjgsoj"
+HH API
+   │
+   ▼
+Vacancy Fetch
+   │
+   ▼
+Text Preprocessing
+   │
+   ▼
+Embedding Generation
+   │
+   ▼
+Vector Store (memmap)
+   │
+   ▼
+FAISS Index Update
+```
+
+This pipeline runs periodically to keep the index up to date.
+
+---
+
+# Project Structure
+
+```id="elq8hr"
+project/
+│
+├── app.py
+│   Streamlit application UI
+│
+├── db.py
+│   SQLite database interface
+│
+├── hh_client.py
+│   HH.ru API client
+│
+├── hh_areas.py
+│   Region and city retrieval
+│
+├── tfidf_terms.py
+│   Resume keyword extraction
+│
+├── search_cleanup.py
+│   Search history cleanup
+│
+├── embedding_store.py
+│   Legacy embedding cache
+│
+├── vector_store.py
+│   Memory-mapped vector storage
+│
+├── global_index_manager.py
+│   Global vacancy index manager
+│
+├── global_faiss_index.py
+│   FAISS index utilities
+│
+└── artifacts/
+    ├── vector_store/
+    └── global_index/
 ```
 
 ---
@@ -259,134 +291,128 @@ pymupdf
 
 Clone repository:
 
-```
-git clone https://github.com/Chupacabra0000/Job-Recommendor
-cd Job-Recommendor
+```bash id="y9cn04"
+git clone https://github.com/yourusername/job_recommendor_hh.ru
+cd job_recommendor_hh.ru
 ```
 
-Create virtual environment (recommended):
+Create virtual environment:
 
-```
+```id="2m1ycy"
 python -m venv venv
 ```
 
 Activate environment:
 
-Windows:
+Linux / Mac
 
-```
-venv\Scripts\activate
-```
-
-Linux / Mac:
-
-```
+```id="4j4fck"
 source venv/bin/activate
+```
+
+Windows
+
+```id="gllh8x"
+venv\Scripts\activate
 ```
 
 Install dependencies:
 
-```
+```id="k2b7u0"
 pip install -r requirements.txt
 ```
 
 ---
 
-# Running the application
+# Running the Application
 
-Start Streamlit server:
+Start the Streamlit app:
 
-```
+```id="4l3lf3"
 streamlit run app.py
 ```
 
-The application will open in your browser.
+Open browser:
 
-Default address:
-
-```
+```id="zw47f8"
 http://localhost:8501
 ```
 
 ---
 
-# HH API Notes
+# Performance
 
-HH.ru requires a proper **User-Agent header**.
+Performance improvements achieved through vector indexing:
 
-The project already sets:
+| Operation             | Traditional approach | This system |
+| --------------------- | -------------------- | ----------- |
+| Vacancy ranking       | 10–25 seconds        | <200 ms     |
+| Embedding computation | every search         | cached      |
+| API calls             | many                 | minimal     |
+| Search complexity     | O(N²)                | FAISS ANN   |
 
-```
-HH-User-Agent: Job-Recommendor
-```
+---
 
-If necessary you can override:
+# Engineering Highlights
 
-```
-export HH_USER_AGENT="Job-Recommendor (your_email@example.com)"
+This project demonstrates several **modern ML system design patterns**:
+
+### Vector search architecture
+
+Widely used in:
+
+* recommendation systems
+* semantic search engines
+* retrieval-augmented generation (RAG)
+
+### Incremental indexing
+
+Avoids expensive full rebuilds.
+
+### Memory-mapped vector storage
+
+Allows large embedding datasets with low memory usage.
+
+### Hybrid storage design
+
+```id="jqu7gp"
+Vectors → memmap
+Metadata → SQLite
+Index → FAISS
 ```
 
 ---
 
-# Performance Optimizations
+# Limitations
 
-The project includes several optimizations:
-
-• lazy vacancy description loading
-• embedding caching
-• FAISS similarity search
-• search result deduplication
-• history size limits
-
-These allow the system to process **thousands of vacancies quickly**.
-
----
-
-# Storage
-
-The project stores data in:
-
-```
-app.db
-```
-
-SQLite database storing:
-
-• users
-• resumes
-• favorites
-• search history
-
----
-
-Embeddings stored in:
-
-```
-artifacts/embeddings.sqlite3
-```
-
-FAISS indexes stored in:
-
-```
-artifacts/faiss/
-```
+* Depends on HH.ru API availability
+* Job descriptions from snippets may be incomplete
+* Index size currently optimized for ~5000–10000 vacancies
 
 ---
 
 # Future Improvements
 
-Possible improvements include:
+Possible extensions:
 
-• asynchronous HH API requests
-• Redis caching
-• background vacancy updates
-• vector database integration (Qdrant / Pinecone)
-
----
-
-# License
-
-MIT License
+* background worker for indexing
+* distributed vector search
+* larger FAISS indexes (IVF/HNSW)
+* improved resume parsing
+* job deduplication
 
 ---
+
+# Technologies Used
+
+* Python
+* Streamlit
+* Sentence Transformers
+* FAISS
+* NumPy
+* SQLite
+* Requests
+
+
+
 
