@@ -1,4 +1,3 @@
-```python
 import sqlite3
 import os
 import base64
@@ -1444,4 +1443,4 @@ def set_global_index_state(key: str, value: str) -> None:
     )
     conn.commit()
     conn.close()
-```
+
