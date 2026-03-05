@@ -1444,3 +1444,34 @@ def set_global_index_state(key: str, value: str) -> None:
     conn.commit()
     conn.close()
 
+
+def global_has_vacancy_ids(ids: List[str]) -> set:
+    """Return a set of vacancy_ids that already exist in global_vacancies."""
+    if not ids:
+        return set()
+    conn = get_conn()
+    cur = conn.cursor()
+    out = set()
+    CHUNK = 500
+    for i in range(0, len(ids), CHUNK):
+        chunk = ids[i:i+CHUNK]
+        placeholders = ",".join(["?"] * len(chunk))
+        cur.execute(f"SELECT vacancy_id FROM global_vacancies WHERE vacancy_id IN ({placeholders})", tuple(chunk))
+        out |= {str(r["vacancy_id"]) for r in cur.fetchall()}
+    conn.close()
+    return out
+
+
+def get_max_global_published_at(area_id: int) -> Optional[str]:
+    """Newest published_at we have for this area_id (ISO string)."""
+    conn = get_conn()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT MAX(published_at) AS mx FROM global_vacancies WHERE area_id=? AND published_at IS NOT NULL",
+        (int(area_id),),
+    )
+    row = cur.fetchone()
+    conn.close()
+    if not row or not row["mx"]:
+        return None
+    return str(row["mx"])
