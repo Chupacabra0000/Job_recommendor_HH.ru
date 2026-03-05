@@ -5,7 +5,7 @@ from typing import Any, Dict, Optional, List
 
 BASE_URL = "https://api.hh.ru"
 
-DEFAULT_UA = "Job-Recommendor/1.0 (contact: h13370375@gmail.com)"
+DEFAULT_UA = "Job-Recommendor/1.0 (contact: rana.shoaib7777@gmail.com)"
 HH_USER_AGENT = os.getenv("HH_USER_AGENT", DEFAULT_UA)
 
 DEFAULT_HEADERS = {
