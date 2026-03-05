@@ -76,3 +76,11 @@ def search(index, query_vec: np.ndarray, top_k: int = 200) -> Tuple[np.ndarray, 
 
     scores, ids = index.search(query_vec, int(top_k))
     return scores[0], ids[0]
+
+
+def load_index_and_ids(area_id: int, period_days: int):
+    idx = load_index(area_id, period_days)
+    ids = load_ids(area_id, period_days)
+    if idx is None or ids is None:
+        return None, None
+    return idx, ids
