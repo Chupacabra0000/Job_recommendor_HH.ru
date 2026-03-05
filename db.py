@@ -1446,20 +1446,40 @@ def set_global_index_state(key: str, value: str) -> None:
 
 
 def global_has_vacancy_ids(ids: List[str]) -> set:
-    """Return a set of vacancy_ids that already exist in global_vacancies."""
+    """Return set of vacancy_ids that already exist in global_vacancies."""
+    ids = [str(x).strip() for x in ids if str(x).strip()]
     if not ids:
         return set()
+
     conn = get_conn()
     cur = conn.cursor()
     out = set()
+
     CHUNK = 500
     for i in range(0, len(ids), CHUNK):
-        chunk = ids[i:i+CHUNK]
+        chunk = ids[i:i + CHUNK]
         placeholders = ",".join(["?"] * len(chunk))
-        cur.execute(f"SELECT vacancy_id FROM global_vacancies WHERE vacancy_id IN ({placeholders})", tuple(chunk))
+        cur.execute(
+            f"SELECT vacancy_id FROM global_vacancies WHERE vacancy_id IN ({placeholders})",
+            tuple(chunk),
+        )
         out |= {str(r["vacancy_id"]) for r in cur.fetchall()}
+
     conn.close()
     return out
+
+
+def set_global_index_state_if_newer(key: str, value_iso_z: str) -> None:
+    """
+    Convenience: store only if newer lexicographically/ISO-wise.
+    ISO Z timestamps compare correctly as strings in practice.
+    """
+    old = get_global_index_state(key)
+    if (old is None) or (str(value_iso_z) > str(old)):
+        set_global_index_state(key, value_iso_z)
+
+
+
 
 
 def get_max_global_published_at(area_id: int) -> Optional[str]:
