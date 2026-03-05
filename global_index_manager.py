@@ -1,4 +1,3 @@
-# global_index_manager.py
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -9,20 +8,17 @@ import numpy as np
 from sentence_transformers import SentenceTransformer
 
 from hh_client import fetch_vacancies
-from embedding_store import init_store, get_embedding, put_embedding
 from db import (
     init_db,
     upsert_global_vacancies,
     set_global_index_state,
     get_global_index_state,
     global_has_vacancy_ids,
-    set_global_index_state_if_newer,
 )
 from global_faiss_index import build_index, save_index, load_index_and_ids
+from vector_store import init_store as init_vec_store, load_ids as load_vec_ids, append_vectors
 
 MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
-
-# Policy A: Always incremental + full rebuild every 24h
 FULL_REBUILD_EVERY_HOURS = 24
 
 
@@ -48,6 +44,24 @@ def _get_model() -> SentenceTransformer:
     return _MODEL
 
 
+def _normalize(v: np.ndarray) -> np.ndarray:
+    denom = np.linalg.norm(v, axis=1, keepdims=True) + 1e-12
+    return v / denom
+
+
+def _vid_to_int64(vid: str) -> int:
+    s = str(vid).strip()
+    try:
+        return int(s)
+    except Exception:
+        h = np.frombuffer(s.encode("utf-8", errors="ignore"), dtype=np.uint8)
+        x = np.uint64(1469598103934665603)
+        for b in h:
+            x ^= np.uint64(int(b))
+            x *= np.uint64(1099511628211)
+        return int(np.int64(x.view(np.int64)))
+
+
 def _job_text_from_item(it: Dict) -> str:
     title = (it.get("name") or "").strip()
     employer = ""
@@ -68,30 +82,6 @@ def _job_text_from_item(it: Dict) -> str:
     return " ".join([p for p in [title, employer, mode, req, resp] if p]).strip()
 
 
-def _normalize(v: np.ndarray) -> np.ndarray:
-    denom = np.linalg.norm(v, axis=1, keepdims=True) + 1e-12
-    return v / denom
-
-
-def _vid_to_int64(vid: str) -> int:
-    """
-    HH vacancy ids are numeric strings, but we keep a safe fallback.
-    Returns a stable signed int64.
-    """
-    s = str(vid).strip()
-    try:
-        return int(s)
-    except Exception:
-        h = np.frombuffer(s.encode("utf-8", errors="ignore"), dtype=np.uint8)
-        # simple stable hash -> 64-bit
-        x = np.uint64(1469598103934665603)  # FNV offset basis
-        for b in h:
-            x ^= np.uint64(int(b))
-            x *= np.uint64(1099511628211)  # FNV prime
-        # map to signed int64 range
-        return int(np.int64(x.view(np.int64)))
-
-
 def refresh_global_index(
     cfg: GlobalIndexConfig,
     *,
@@ -100,12 +90,10 @@ def refresh_global_index(
 ) -> Tuple[bool, str]:
     """
     Policy A:
-      - Incremental updates on each refresh
+      - Incremental updates normally
       - Full rebuild at least every 24h (or when index missing)
-    Returns (did_refresh, message)
     """
     init_db()
-    init_store()
 
     key_refresh = f"global_index:last_refresh:area={int(cfg.area_id)}:days={int(cfg.period_days)}"
     key_full = f"global_index:last_full_rebuild:area={int(cfg.area_id)}:days={int(cfg.period_days)}"
@@ -113,7 +101,6 @@ def refresh_global_index(
     last_refresh = get_global_index_state(key_refresh)
     last_full = get_global_index_state(key_full)
 
-    # Throttle frequent refresh
     if not force and last_refresh:
         try:
             last_dt = datetime.fromisoformat(last_refresh.replace("Z", "+00:00"))
@@ -122,10 +109,8 @@ def refresh_global_index(
         except Exception:
             pass
 
-    # Decide whether full rebuild is needed (24h rule) or index missing
     idx_existing, ids_existing = load_index_and_ids(int(cfg.area_id), int(cfg.period_days))
     need_full = False
-
     if idx_existing is None or ids_existing is None:
         need_full = True
 
@@ -137,13 +122,12 @@ def refresh_global_index(
         except Exception:
             need_full = True
     elif not need_full and not force and not last_full:
-        # no full rebuild stamp yet -> do one
         need_full = True
 
     if force:
         need_full = True
 
-    # 1) Fetch latest vacancies for the given area+period (global pool not keyword-limited)
+    # 1) Fetch latest vacancies
     items = fetch_vacancies(
         text=None,
         area=int(cfg.area_id),
@@ -153,17 +137,15 @@ def refresh_global_index(
         order_by="publication_time",
     )
 
-    # Build item map once (prevents O(N^2) next(...) scans)
     item_by_id = {str(x.get("id", "")).strip(): x for x in items if x.get("id")}
 
-    # 2) Convert to DB rows
-    rows: List[Dict[str, str]] = []
+    # 2) Upsert metadata rows (DB)
+    rows: List[Dict] = []
     for it in items:
         vid = str(it.get("id", "")).strip()
         if not vid:
             continue
 
-        # salary text (light)
         salary_text = ""
         sal = it.get("salary")
         if isinstance(sal, dict):
@@ -198,9 +180,6 @@ def refresh_global_index(
             )
         )
 
-    # 2.5) DB upsert strategy:
-    #   - Full rebuild day: upsert all (OK once/day)
-    #   - Incremental: upsert only new vacancy_ids (reduces DB writes)
     if need_full:
         upsert_global_vacancies(rows)
     else:
@@ -210,33 +189,33 @@ def refresh_global_index(
         if new_rows:
             upsert_global_vacancies(new_rows)
 
-    # 3) Build vectors, embedding only missing ids (cached)
+    # 3) Vector store (memmap) instead of SQLite embeddings
     model = _get_model()
     dim = int(model.get_sentence_embedding_dimension())
+    init_vec_store(MODEL_NAME, dim)
 
-    all_vecs = np.zeros((len(rows), dim), dtype=np.float32)
-    all_ids = np.zeros((len(rows),), dtype=np.int64)
+    vec_ids = load_vec_ids(MODEL_NAME)
+    vec_id_set = set(vec_ids.tolist()) if vec_ids is not None else set()
+
+    # Determine which ids we need to embed
+    all_ids_int = np.array([_vid_to_int64(r["vacancy_id"]) for r in rows], dtype=np.int64)
+
+    # If full rebuild, we still only embed what is missing in vector store (store persists across areas)
+    # But for cleanliness you can choose to re-embed all; this keeps compute low.
+    missing_mask = np.array([int(x) not in vec_id_set for x in all_ids_int], dtype=bool)
+    missing_ids = all_ids_int[missing_mask]
 
     missing_texts: List[str] = []
-    missing_vids: List[str] = []
-    missing_pos: List[int] = []
+    if missing_ids.size > 0:
+        # Build texts for missing IDs
+        for r in rows:
+            vid = str(r["vacancy_id"])
+            vid_i = _vid_to_int64(vid)
+            if vid_i in set(missing_ids.tolist()):
+                it = item_by_id.get(vid)
+                txt = _job_text_from_item(it) if it else f"{r['title']} {r['employer']} {r['snippet_req']} {r['snippet_resp']}"
+                missing_texts.append(txt)
 
-    for i, r in enumerate(rows):
-        vid = str(r["vacancy_id"])
-        all_ids[i] = np.int64(_vid_to_int64(vid))
-
-        cached = get_embedding(vid, MODEL_NAME)
-        if cached is not None:
-            all_vecs[i] = np.asarray(cached, dtype=np.float32)
-            continue
-
-        it = item_by_id.get(vid)
-        txt = _job_text_from_item(it) if it else f"{r['title']} {r['employer']} {r['snippet_req']} {r['snippet_resp']}"
-        missing_vids.append(vid)
-        missing_texts.append(txt)
-        missing_pos.append(i)
-
-    if missing_texts:
         new_vecs = model.encode(
             missing_texts,
             batch_size=64,
@@ -244,40 +223,57 @@ def refresh_global_index(
             normalize_embeddings=True,
         )
         new_vecs = np.asarray(new_vecs, dtype=np.float32)
+        new_vecs = _normalize(new_vecs)
 
-        for vid, vec in zip(missing_vids, new_vecs):
-            put_embedding(vid, MODEL_NAME, vec)
+        # Append to vector store
+        all_vec_ids_after, appended_vecs = append_vectors(MODEL_NAME, missing_ids, new_vecs)
 
-        for j, pos in enumerate(missing_pos):
-            all_vecs[pos] = new_vecs[j]
-
-    all_vecs = _normalize(all_vecs)
-
-    # 4) FAISS strategy:
-    #   - Full rebuild every 24h: rebuild from scratch
-    #   - Otherwise: incremental add only new ids
+    # 4) FAISS: Full rebuild daily, incremental otherwise
     if need_full or idx_existing is None or ids_existing is None:
-        index = build_index(all_vecs, all_ids)
-        save_index(int(cfg.area_id), int(cfg.period_days), index, all_ids)
-        did_update_index = True
+        # Full rebuild: we only rebuild FAISS from the CURRENT rows
+        # That keeps FAISS index aligned with area+period pool.
+        # We must have vectors for all_ids_int; ensure any missing were embedded above.
+        # For speed, we embed missing only; vectors are stored globally and reusable.
+
+        # Build vectors for current pool by reading from vector store is optional but more code.
+        # Simpler: rebuild from current embeddings by encoding ALL row texts (expensive).
+        # Instead, we rebuild by incrementally adding only current IDs (fast) after clearing:
+        # easiest: just rebuild from scratch using ONLY current missing/new vectors is not enough.
+        #
+        # So for full rebuild day, we rebuild FAISS using current pool vectors by
+        # encoding current pool texts. This happens only once/day.
+
+        texts = [_job_text_from_item(item_by_id.get(str(r["vacancy_id"]))) for r in rows]
+        vecs = model.encode(texts, batch_size=64, show_progress_bar=False, normalize_embeddings=True)
+        vecs = _normalize(np.asarray(vecs, dtype=np.float32))
+
+        index = build_index(vecs, all_ids_int)
+        save_index(int(cfg.area_id), int(cfg.period_days), index, all_ids_int)
         mode = "FULL rebuild"
+        did_update = True
     else:
         existing_set = set(ids_existing.tolist())
-        mask = np.array([int(x) not in existing_set for x in all_ids], dtype=bool)
-        if np.any(mask):
-            add_vecs = all_vecs[mask].astype(np.float32)
-            add_ids = all_ids[mask].astype(np.int64)
+        # add only missing from this pool that are not already in index
+        to_add = np.array([int(x) not in existing_set for x in all_ids_int], dtype=bool)
+        if np.any(to_add):
+            # for incremental add, encode only those texts (fast)
+            add_ids = all_ids_int[to_add]
+            add_texts = []
+            for r in rows:
+                vid_i = _vid_to_int64(r["vacancy_id"])
+                if int(vid_i) in set(add_ids.tolist()):
+                    it = item_by_id.get(str(r["vacancy_id"]))
+                    add_texts.append(_job_text_from_item(it) if it else f"{r['title']} {r['employer']} {r['snippet_req']} {r['snippet_resp']}")
 
-            # idx_existing is IndexIDMap2 -> supports add_with_ids
-            idx_existing.add_with_ids(add_vecs, add_ids)
+            add_vecs = model.encode(add_texts, batch_size=64, show_progress_bar=False, normalize_embeddings=True)
+            add_vecs = _normalize(np.asarray(add_vecs, dtype=np.float32))
 
+            idx_existing.add_with_ids(add_vecs.astype(np.float32), add_ids.astype(np.int64))
             merged_ids = np.concatenate([ids_existing.astype(np.int64), add_ids.astype(np.int64)])
             save_index(int(cfg.area_id), int(cfg.period_days), idx_existing, merged_ids)
-
-            did_update_index = True
+            did_update = True
         else:
-            did_update_index = False
-
+            did_update = False
         mode = "INCREMENTAL"
 
     stamp = _utcnow().isoformat().replace("+00:00", "Z")
@@ -285,8 +281,7 @@ def refresh_global_index(
     if need_full:
         set_global_index_state(key_full, stamp)
 
-    msg = (
-        f"Global index refreshed ({mode}): fetched={len(rows)} vacancies, "
-        f"dim={dim}, added_to_index={'yes' if did_update_index else 'no'}, at {stamp}."
+    return True, (
+        f"Global index refreshed ({mode}): fetched={len(rows)}, dim={dim}, "
+        f"index_updated={'yes' if did_update else 'no'}, at {stamp}."
     )
-    return True, msg
